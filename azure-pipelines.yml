@@ -1,0 +1,201 @@
+# Python Function App to Linux on Azure
+
+# Build a Python function app and deploy it to Azure as a Linux function app.
+# Add steps that analyze code, save build artifacts, deploy, and more:
+# https://docs.microsoft.com/azure/devops/pipelines/languages/python
+trigger:
+  - master
+  
+variables:
+    # Azure Resource Manager connection created during pipeline creation
+    azureSubscription: 'azureSubscription'
+  
+    # Agent VM image name
+    vmImageName: 'ubuntu-latest'
+  
+    # Working Directory
+    workingDirectory: '$(System.DefaultWorkingDirectory)/ACRFuncs'
+  
+stages:
+- stage: Build
+  displayName: Build stage
+
+  jobs:
+  - job: Build
+    displayName: Build
+    pool:
+      vmImage: $(vmImageName)
+
+    steps:
+    - bash: |
+        if [ -f extensions.csproj ]
+        then
+            dotnet build extensions.csproj --runtime ubuntu.16.04-x64 --output ./bin
+        fi
+      workingDirectory: $(workingDirectory)
+      displayName: 'Build extensions'
+
+    - task: UsePythonVersion@0
+      displayName: 'Use Python 3.7'
+      inputs:
+        versionSpec: 3.7 # Functions V2 supports Python 3.7
+  
+    # pip install -r requirements.txt    
+    - bash: |
+        python -m venv worker_venv
+        source worker_venv/bin/activate
+        pip3.7 install --target="$(workingDirectory)/.python_packages/lib/site-packages" -r "$(workingDirectory)/requirements.txt"
+      workingDirectory: $(workingDirectory)
+      displayName: 'Install application dependencies'
+
+    - task: ArchiveFiles@2
+      displayName: 'Archive files'
+      inputs:
+        rootFolderOrFile: '$(workingDirectory)'
+        includeRootFolder: false
+        archiveType: zip
+        archiveFile: $(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip
+        replaceExistingArchive: true
+
+    - publish: $(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip
+      artifact: drop
+
+- stage: Deploy
+  displayName: Deploy stage
+  dependsOn: Build
+  condition: succeeded()
+
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy
+    environment: 'development'
+    pool:
+      vmImage: $(vmImageName)
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@1
+            displayName: 'Create RG, SA, FuncApp '
+            inputs:
+              azureSubscription: azureSubscription
+              scriptLocation: inlineScript
+              inlineScript: |
+                resourceGroup=$(az group show --name $RESOURCE_GROUP_NAME --query 'id')
+                if test -z "$resourceGroup" 
+                then
+                  az group create \
+                    --name $RESOURCE_GROUP_NAME \
+                    --location $REGION
+                else 
+                  echo "Resource Group exits"
+                fi
+
+                storageAccount=$(az storage account show --name $STORAGE_ACCOUNT_NAME --query 'id')
+                if test -z $storageAccount 
+                then
+                  az storage account create \
+                    --name $STORAGE_ACCOUNT_NAME \
+                    --location $REGION \
+                    --resource-group $RESOURCE_GROUP_NAME \
+                    --sku Standard_LRS \
+                    --https-only true
+                else 
+                  echo "Storage Account exits"
+                fi                
+                
+                functionApp=$(az functionapp show --name $FUNCTIONAPP_NAME --resource-group $RESOURCE_GROUP_NAME --query 'id')
+                if test -z $functionApp
+                then
+                  az functionapp create \
+                    --name $FUNCTIONAPP_NAME \
+                    --resource-group $RESOURCE_GROUP_NAME \
+                    --storage-account $STORAGE_ACCOUNT_NAME \
+                    --consumption-plan-location $REGION \
+                    --functions-version 2
+
+                # Get the storage account connection string. 
+                connstr=$(az storage account show-connection-string --name $STORAGE_ACCOUNT_NAME --resource-group $RESOURCE_GROUP_NAME --query connectionString --output tsv)
+                
+                # Update function app settings to connect to the storage account.
+                
+                az functionapp config appsettings set \
+                  --name $FUNCTIONAPP_NAME \
+                  --resource-group $RESOURCE_GROUP_NAME \
+                  --settings StorageConStr=$connstr
+                  else
+                  echo "Function App exists"
+                fi
+
+                acr=$(az acr show --name $ACR_NAME --query 'id')
+                if test -z "$acr" 
+                then 
+                  az acr create --name $ACR_NAME --resource-group $RESOURCE_GROUP_NAME --location $REGION --sku basic
+                else
+                  echo "ACR exits"
+                fi
+
+          - task: AzureFunctionApp@1
+            displayName: 'Azure Functions App Code deploy'
+            condition: succeeded()
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              appType: functionAppLinux
+              appName: $(FUNCTIONAPP_NAME)
+              resourceGroupName: '$(RESOURCE_GROUP_NAME)'
+              package: '$(Pipeline.Workspace)/drop/$(Build.BuildId).zip'
+
+- stage: AppSettingUpdate
+  displayName: Updating AppSettings
+  dependsOn: Deploy
+  condition: succeeded()
+  
+  jobs:
+  - deployment: UpdateAppSettings
+    displayName: Updating Slack Webhook AppSettings
+    environment: 'development'
+    pool:
+      vmImage: $(vmImageName)
+  
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureAppServiceSettings@1
+            displayName: 'App Settings Update'
+            inputs:
+              azureSubscription: 'azureSubscription'
+              appName: $(FUNCTIONAPP_NAME)
+              resourceGroupName: '$(RESOURCE_GROUP_NAME)'
+              appSettings: |
+                [
+                  {
+                    "name": "SLACK_IMAGE_PUSH",
+                    "value": "$(slack_image_push_url)",
+                    "slotSetting": false
+                  }
+                ]
+          - task: AzureCLI@1
+            displayName: 'Register EventGrid Subscription'
+            inputs:
+              azureSubscription: azureSubscription
+              scriptLocation: inlineScript
+              inlineScript: |
+
+                az extension add --name eventgrid
+                SUBSCRIPTION_ID=$(az account show --query id --output tsv)
+                ENDPOINT="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP_NAME/providers/Microsoft.Web/sites/$FUNCTIONAPP_NAME/functions/$FUNCTION_NAME"
+                ACR_RESOURCE_ID=$(az acr show --name $ACR_NAME --query 'id' --output tsv)
+                
+                echo "=========  Variables ========="
+                echo "subs: $SUBSCRIPTION_ID"
+                echo "endpoint: $ENDPOINT"
+                echo "SourceResourceId: $ACR_RESOURCE_ID"
+                echo "============================"
+
+                az eventgrid event-subscription create --endpoint $ENDPOINT \
+                  --endpoint-type azurefunction \
+                  --included-event-types Microsoft.ContainerRegistry.ImagePushed \
+                  --source-resource-id $ACR_RESOURCE_ID \
+                  --name $EVENT_SUBSCRIPTION_NAME
