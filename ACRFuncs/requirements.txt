@@ -1,2 +1,2 @@
 azure-functions
-requests==2.19.1
+requests==2.20.0
